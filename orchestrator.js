@@ -4,6 +4,8 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const DEFAULT_MODEL = "github-copilot/gpt-5.2-codex";
 const COMMIT_MODEL = "github-copilot/gpt-5-mini";
+const DEFAULT_AGENT = "build-gpt-5.2-codex";
+const COMMIT_AGENT = "build";
 const DEFAULT_REVIEW_COMMAND_NAME = "review-uncommited";
 const DEFAULT_REVIEW_COMMAND_ARGUMENTS = "";
 const DEFAULT_REVIEW_TIMEOUT_MS = 60 * 60 * 1000;
@@ -89,7 +91,8 @@ async function runCommitInstance(createOpencode, root) {
       sessionID,
       buildCommitPrompt(),
       root,
-      COMMIT_MODEL
+      COMMIT_MODEL,
+      COMMIT_AGENT
     );
     await waitForSessionIdle(client, sessionID, root);
   } finally {
@@ -161,6 +164,7 @@ async function runReviewCommand(createOpencode, root) {
         body: {
           command: commandName,
           arguments: commandArguments,
+          agent: DEFAULT_AGENT,
           model: DEFAULT_MODEL,
         },
       }),
@@ -197,7 +201,8 @@ async function sendPrompt(
   sessionID,
   text,
   root,
-  modelSpec = DEFAULT_MODEL
+  modelSpec = DEFAULT_MODEL,
+  agentSpec = DEFAULT_AGENT
 ) {
   const model = parseModelSpec(modelSpec);
   await unwrap(
@@ -205,6 +210,7 @@ async function sendPrompt(
       path: { id: sessionID },
       query: { directory: root },
       body: {
+        agent: agentSpec,
         model,
         parts: [{ type: "text", text }],
       },
