@@ -50,23 +50,23 @@ async function runWorkInstance(createOpencode, docs, root) {
     const sessionID = extractSessionID(session, "session.create (work instance)");
     const promptPaths = buildPromptPaths(docs, root);
 
-    await sendPrompt(
+    const workMessageID = await sendPrompt(
       client,
       sessionID,
       buildMilestonePrompt(promptPaths),
       root
     );
-    await waitForSessionIdle(client, sessionID, root);
+    await waitForMessageComplete(client, sessionID, workMessageID, root);
 
     await runReviewLoop(createOpencode, client, sessionID, root);
 
-    await sendPrompt(
+    const markTasksMessageID = await sendPrompt(
       client,
       sessionID,
       buildMarkTasksPrompt(promptPaths.plan),
       root
     );
-    await waitForSessionIdle(client, sessionID, root);
+    await waitForMessageComplete(client, sessionID, markTasksMessageID, root);
   } finally {
     await disposeInstance(client, server, root);
   }
@@ -86,7 +86,7 @@ async function runCommitInstance(createOpencode, root) {
     );
 
     const sessionID = extractSessionID(session, "session.create (commit instance)");
-    await sendPrompt(
+    const commitMessageID = await sendPrompt(
       client,
       sessionID,
       buildCommitPrompt(),
@@ -94,7 +94,7 @@ async function runCommitInstance(createOpencode, root) {
       COMMIT_MODEL,
       COMMIT_AGENT
     );
-    await waitForSessionIdle(client, sessionID, root);
+    await waitForMessageComplete(client, sessionID, commitMessageID, root);
   } finally {
     await disposeInstance(client, server, root);
   }
@@ -118,13 +118,13 @@ async function runReviewLoop(createOpencode, client, sessionID, root) {
       ? reviewResult.findings.length
       : "unknown";
     logStep(`Review found ${findingsCount} issues; requesting fixes.`);
-    await sendPrompt(
+    const fixMessageID = await sendPrompt(
       client,
       sessionID,
       buildFindingsPrompt(reviewResult),
       root
     );
-    await waitForSessionIdle(client, sessionID, root);
+    await waitForMessageComplete(client, sessionID, fixMessageID, root);
   }
 
   throw new Error(
@@ -171,10 +171,17 @@ async function runReviewCommand(createOpencode, root) {
       "session.command"
     );
 
-    await waitForSessionIdle(client, sessionID, root, timeoutMs);
+    const commandMessageID = extractMessageID(commandResult);
+    await waitForMessageComplete(
+      client,
+      sessionID,
+      commandMessageID,
+      root,
+      timeoutMs
+    );
 
     let parts = commandResult?.parts ?? [];
-    const messageID = commandResult?.info?.id;
+    const messageID = extractMessageID(commandResult);
     if (messageID) {
       const message = await unwrap(
         client.session.message({
@@ -205,7 +212,7 @@ async function sendPrompt(
   agentSpec = DEFAULT_AGENT
 ) {
   const model = parseModelSpec(modelSpec);
-  await unwrap(
+  const response = await unwrap(
     client.session.prompt({
       path: { id: sessionID },
       query: { directory: root },
@@ -217,6 +224,8 @@ async function sendPrompt(
     }),
     "session.prompt"
   );
+
+  return extractMessageID(response);
 }
 
 async function waitForSessionIdle(client, sessionID, root, timeoutOverrideMs) {
@@ -232,18 +241,19 @@ async function waitForSessionIdle(client, sessionID, root, timeoutOverrideMs) {
   );
 
   const start = Date.now();
+  let lastKnownSessions = [];
   while (Date.now() - start < timeoutMs) {
     const statusMap = await unwrap(
       client.session.status({ query: { directory: root } }),
       "session.status"
     );
+    if (statusMap && typeof statusMap === "object") {
+      lastKnownSessions = Object.keys(statusMap);
+    }
     const status = statusMap?.[sessionID];
     if (!status) {
-      const knownSessions = statusMap ? Object.keys(statusMap) : [];
-      const knownList = knownSessions.length ? knownSessions.join(", ") : "none";
-      throw new Error(
-        `Session status missing for ${sessionID}. Known sessions: ${knownList}.`
-      );
+      await delay(pollIntervalMs);
+      continue;
     }
     if (status.type === "idle") {
       return;
@@ -251,7 +261,59 @@ async function waitForSessionIdle(client, sessionID, root, timeoutOverrideMs) {
     await delay(pollIntervalMs);
   }
 
-  throw new Error(`Timed out waiting for session ${sessionID} to go idle.`);
+  const knownList = lastKnownSessions.length
+    ? lastKnownSessions.join(", ")
+    : "none";
+  throw new Error(
+    `Timed out waiting for session ${sessionID} to go idle. Known sessions: ${knownList}.`
+  );
+}
+
+async function waitForMessageComplete(
+  client,
+  sessionID,
+  messageID,
+  root,
+  timeoutOverrideMs
+) {
+  if (!messageID) {
+    await waitForSessionIdle(client, sessionID, root, timeoutOverrideMs);
+    return;
+  }
+
+  const timeoutMs =
+    timeoutOverrideMs ??
+    parseNumber(
+      process.env.ORCHESTRATOR_SESSION_TIMEOUT_MS,
+      DEFAULT_SESSION_TIMEOUT_MS
+    );
+  const pollIntervalMs = parseNumber(
+    process.env.ORCHESTRATOR_STATUS_POLL_INTERVAL_MS,
+    DEFAULT_STATUS_POLL_INTERVAL_MS
+  );
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const message = await unwrap(
+      client.session.message({
+        path: { id: sessionID, messageID },
+        query: { directory: root },
+      }),
+      "session.message"
+    );
+    const info = message?.info ?? message;
+    if (info?.error) {
+      throw new Error(
+        `Session message ${messageID} failed: ${formatError(info.error)}`
+      );
+    }
+    if (info?.time?.completed || info?.finish) {
+      return;
+    }
+    await delay(pollIntervalMs);
+  }
+
+  throw new Error(`Timed out waiting for message ${messageID} to complete.`);
 }
 
 async function resolveDocs(root) {
@@ -504,6 +566,33 @@ function extractSessionID(session, context) {
   throw new Error(
     `${context} returned a session without an id. Response: ${safeStringify(session)}`
   );
+}
+
+function extractMessageID(message) {
+  if (!message || typeof message !== "object") {
+    return;
+  }
+
+  const candidates = [
+    message.info?.id,
+    message.info?.messageID,
+    message.id,
+    message.messageID,
+    message.data?.info?.id,
+    message.data?.info?.messageID,
+    message.data?.id,
+    message.data?.messageID,
+    message.properties?.info?.id,
+    message.properties?.info?.messageID,
+    message.properties?.id,
+    message.properties?.messageID,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
 }
 
 function safeStringify(value, maxLength = 1000) {
