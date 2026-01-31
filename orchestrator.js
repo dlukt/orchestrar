@@ -12,10 +12,19 @@ const DEFAULT_REVIEW_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const DEFAULT_MAX_REVIEW_ITERATIONS = 20;
+const DEFAULT_DEBUG_ENABLED = true;
+const DEBUG_ENABLED = parseBoolean(
+  process.env.ORCHESTRATOR_DEBUG,
+  DEFAULT_DEBUG_ENABLED
+);
 
 async function main() {
   const root = process.cwd();
+  logDebug(`Starting orchestrator in ${root}`);
   const docs = await resolveDocs(root);
+  logDebug(
+    `Docs resolved: prd=${docs.prd}, spec=${docs.spec}, plan=${docs.plan}`
+  );
   const planPath = docs.plan;
   const { createOpencode } = await import("@opencode-ai/sdk");
 
@@ -38,13 +47,15 @@ async function runWorkInstance(createOpencode, docs, root) {
   const { client, server } = await createOpencode({
     config: buildConfig(DEFAULT_MODEL),
   });
+  logDebug(`OpenCode server started at ${server.url}`);
   try {
-    const session = await unwrap(
+    logDebug("Creating milestone session");
+    const session = await callClient(
+      "session.create",
       client.session.create({
         query: { directory: root },
         body: { title: "Milestone Orchestrator" },
-      }),
-      "session.create"
+      })
     );
 
     const sessionID = extractSessionID(session, "session.create (work instance)");
@@ -76,13 +87,15 @@ async function runCommitInstance(createOpencode, root) {
   const { client, server } = await createOpencode({
     config: buildConfig(COMMIT_MODEL),
   });
+  logDebug(`OpenCode server started at ${server.url}`);
   try {
-    const session = await unwrap(
+    logDebug("Creating commit session");
+    const session = await callClient(
+      "session.create",
       client.session.create({
         query: { directory: root },
         body: { title: "Commit & Push" },
-      }),
-      "session.create"
+      })
     );
 
     const sessionID = extractSessionID(session, "session.create (commit instance)");
@@ -104,6 +117,11 @@ async function runReviewLoop(client, sessionID, root) {
   const maxIterations = parseNumber(
     process.env.ORCHESTRATOR_MAX_REVIEW_ITERATIONS,
     DEFAULT_MAX_REVIEW_ITERATIONS
+  );
+  logDebug(
+    `Review loop configured: maxIterations=${maxIterations}, command=${
+      process.env.ORCHESTRATOR_REVIEW_COMMAND || DEFAULT_REVIEW_COMMAND_NAME
+    }`
   );
 
   for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
@@ -142,16 +160,21 @@ async function runReviewCommand(client, root) {
     process.env.ORCHESTRATOR_REVIEW_TIMEOUT_MS,
     DEFAULT_REVIEW_TIMEOUT_MS
   );
-  const session = await unwrap(
+  logDebug(
+    `Starting review command: name=${commandName}, args=${commandArguments ||
+      "<none>"}, timeoutMs=${timeoutMs}`
+  );
+  const session = await callClient(
+    "session.create",
     client.session.create({
       query: { directory: root },
       body: { title: "Review" },
-    }),
-    "session.create"
+    })
   );
 
   const sessionID = extractSessionID(session, "session.create (review instance)");
-  const commandResult = await unwrap(
+  const commandResult = await callClient(
+    "session.command",
     client.session.command({
       path: { id: sessionID },
       query: { directory: root },
@@ -161,8 +184,7 @@ async function runReviewCommand(client, root) {
         agent: DEFAULT_AGENT,
         model: DEFAULT_MODEL,
       },
-    }),
-    "session.command"
+    })
   );
 
   const commandMessageID = extractMessageID(commandResult);
@@ -177,17 +199,18 @@ async function runReviewCommand(client, root) {
   let parts = commandResult?.parts ?? [];
   const messageID = extractMessageID(commandResult);
   if (messageID) {
-    const message = await unwrap(
+    const message = await callClient(
+      "session.message",
       client.session.message({
         path: { id: sessionID, messageID },
         query: { directory: root },
-      }),
-      "session.message"
+      })
     );
     parts = message?.parts ?? parts;
   }
 
   const output = collectCommandOutput(parts);
+  logDebug(`Review command output length: ${output.length}`);
   if (!output.trim()) {
     throw new Error("Review command produced no output.");
   }
@@ -203,7 +226,11 @@ async function sendPrompt(
   agentSpec = DEFAULT_AGENT
 ) {
   const model = parseModelSpec(modelSpec);
-  const response = await unwrap(
+  logDebug(
+    `Sending prompt to session ${sessionID}: ${summarizeText(text, 160)}`
+  );
+  const response = await callClient(
+    "session.prompt",
     client.session.prompt({
       path: { id: sessionID },
       query: { directory: root },
@@ -212,8 +239,7 @@ async function sendPrompt(
         model,
         parts: [{ type: "text", text }],
       },
-    }),
-    "session.prompt"
+    })
   );
 
   return extractMessageID(response);
@@ -230,18 +256,28 @@ async function waitForSessionIdle(client, sessionID, root, timeoutOverrideMs) {
     process.env.ORCHESTRATOR_STATUS_POLL_INTERVAL_MS,
     DEFAULT_STATUS_POLL_INTERVAL_MS
   );
+  logDebug(
+    `Waiting for session ${sessionID} idle (timeoutMs=${timeoutMs}, pollMs=${pollIntervalMs})`
+  );
 
   const start = Date.now();
   let lastKnownSessions = [];
+  let attempt = 0;
   while (Date.now() - start < timeoutMs) {
-    const statusMap = await unwrap(
-      client.session.status({ query: { directory: root } }),
-      "session.status"
+    attempt += 1;
+    const statusMap = await callClient(
+      "session.status",
+      client.session.status({ query: { directory: root } })
     );
     if (statusMap && typeof statusMap === "object") {
       lastKnownSessions = Object.keys(statusMap);
     }
     const status = statusMap?.[sessionID];
+    logDebug(
+      `Session status poll ${attempt}: session=${sessionID}, status=${
+        status?.type || "<missing>"
+      }, known=${lastKnownSessions.length}`
+    );
     if (!status) {
       await delay(pollIntervalMs);
       continue;
@@ -282,17 +318,27 @@ async function waitForMessageComplete(
     process.env.ORCHESTRATOR_STATUS_POLL_INTERVAL_MS,
     DEFAULT_STATUS_POLL_INTERVAL_MS
   );
+  logDebug(
+    `Waiting for message ${messageID} (timeoutMs=${timeoutMs}, pollMs=${pollIntervalMs})`
+  );
 
   const start = Date.now();
+  let attempt = 0;
   while (Date.now() - start < timeoutMs) {
-    const message = await unwrap(
+    attempt += 1;
+    const message = await callClient(
+      "session.message",
       client.session.message({
         path: { id: sessionID, messageID },
         query: { directory: root },
-      }),
-      "session.message"
+      })
     );
     const info = message?.info ?? message;
+    logDebug(
+      `Message poll ${attempt}: message=${messageID}, completed=${
+        info?.time?.completed ? "yes" : "no"
+      }, finish=${info?.finish || "<none>"}`
+    );
     if (info?.error) {
       throw new Error(
         `Session message ${messageID} failed: ${formatError(info.error)}`
@@ -454,6 +500,20 @@ function parseNumber(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
 function buildConfig(model) {
   return {
     model,
@@ -480,9 +540,9 @@ function parseModelSpec(spec) {
 
 async function disposeInstance(client, server, root) {
   try {
-    await unwrap(
-      client.instance.dispose({ query: { directory: root } }),
-      "instance.dispose"
+    await callClient(
+      "instance.dispose",
+      client.instance.dispose({ query: { directory: root } })
     );
   } catch (error) {
     logStep(`Instance dispose failed: ${formatError(error)}`);
@@ -525,6 +585,19 @@ async function unwrap(result, label) {
   }
 
   return result;
+}
+
+async function callClient(label, promise) {
+  const start = Date.now();
+  logDebug(`${label} -> start`);
+  try {
+    const data = await unwrap(promise, label);
+    logDebug(`${label} -> ok (${Date.now() - start}ms)`);
+    return data;
+  } catch (error) {
+    logDebug(`${label} -> error (${Date.now() - start}ms): ${formatError(error)}`);
+    throw error;
+  }
 }
 
 function extractSessionID(session, context) {
@@ -618,6 +691,24 @@ function delay(ms) {
 
 function logStep(message) {
   console.log(`[orchestrator] ${message}`);
+}
+
+function logDebug(message) {
+  if (!DEBUG_ENABLED) {
+    return;
+  }
+  console.log(`[orchestrator][debug] ${message}`);
+}
+
+function summarizeText(text, maxLength) {
+  if (typeof text !== "string") {
+    return "<non-text>";
+  }
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, maxLength)}...`;
 }
 
 main().catch((error) => {
