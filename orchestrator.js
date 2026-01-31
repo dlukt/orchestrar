@@ -446,7 +446,11 @@ async function fileExists(filePath) {
   }
 }
 
-function unwrap(result, label) {
+async function unwrap(result, label) {
+  if (result && typeof result.then === "function") {
+    result = await result;
+  }
+
   if (!result || typeof result !== "object") {
     return result;
   }
