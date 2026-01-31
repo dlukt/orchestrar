@@ -47,7 +47,7 @@ async function runWorkInstance(createOpencode, docs, root) {
       "session.create"
     );
 
-    const sessionID = session.id;
+    const sessionID = extractSessionID(session, "session.create (work instance)");
     const promptPaths = buildPromptPaths(docs, root);
 
     await sendPrompt(
@@ -85,7 +85,7 @@ async function runCommitInstance(createOpencode, root) {
       "session.create"
     );
 
-    const sessionID = session.id;
+    const sessionID = extractSessionID(session, "session.create (commit instance)");
     await sendPrompt(
       client,
       sessionID,
@@ -156,7 +156,7 @@ async function runReviewCommand(createOpencode, root) {
       "session.create"
     );
 
-    const sessionID = session.id;
+    const sessionID = extractSessionID(session, "session.create (review instance)");
     const commandResult = await unwrap(
       client.session.command({
         path: { id: sessionID },
@@ -239,7 +239,11 @@ async function waitForSessionIdle(client, sessionID, root, timeoutOverrideMs) {
     );
     const status = statusMap?.[sessionID];
     if (!status) {
-      throw new Error(`Session status missing for ${sessionID}.`);
+      const knownSessions = statusMap ? Object.keys(statusMap) : [];
+      const knownList = knownSessions.length ? knownSessions.join(", ") : "none";
+      throw new Error(
+        `Session status missing for ${sessionID}. Known sessions: ${knownList}.`
+      );
     }
     if (status.type === "idle") {
       return;
@@ -450,6 +454,46 @@ function unwrap(result, label) {
     return result.data;
   }
   return result;
+}
+
+function extractSessionID(session, context) {
+  if (!session || typeof session !== "object") {
+    throw new Error(`${context} did not return a session object.`);
+  }
+
+  const candidates = [
+    session.id,
+    session.sessionID,
+    session.info?.id,
+    session.info?.sessionID,
+    session.properties?.id,
+    session.properties?.sessionID,
+    session.properties?.info?.id,
+    session.properties?.info?.sessionID,
+    session.slug,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `${context} returned a session without an id. Response: ${safeStringify(session)}`
+  );
+}
+
+function safeStringify(value, maxLength = 1000) {
+  try {
+    const json = JSON.stringify(value);
+    if (typeof json === "string" && json.length > 0) {
+      return json.length > maxLength ? `${json.slice(0, maxLength)}...` : json;
+    }
+  } catch (error) {
+    // fall through to String()
+  }
+  return String(value);
 }
 
 function formatError(error) {
