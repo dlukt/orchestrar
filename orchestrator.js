@@ -58,7 +58,7 @@ async function runWorkInstance(createOpencode, docs, root) {
     );
     await waitForMessageComplete(client, sessionID, workMessageID, root);
 
-    await runReviewLoop(createOpencode, client, sessionID, root);
+    await runReviewLoop(client, sessionID, root);
 
     const markTasksMessageID = await sendPrompt(
       client,
@@ -100,7 +100,7 @@ async function runCommitInstance(createOpencode, root) {
   }
 }
 
-async function runReviewLoop(createOpencode, client, sessionID, root) {
+async function runReviewLoop(client, sessionID, root) {
   const maxIterations = parseNumber(
     process.env.ORCHESTRATOR_MAX_REVIEW_ITERATIONS,
     DEFAULT_MAX_REVIEW_ITERATIONS
@@ -108,7 +108,7 @@ async function runReviewLoop(createOpencode, client, sessionID, root) {
 
   for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
     logStep(`Running review (${iteration}/${maxIterations})`);
-    const reviewResult = await runReviewCommand(createOpencode, root);
+    const reviewResult = await runReviewCommand(client, root);
     if (isFindingsEmpty(reviewResult)) {
       logStep("Review clean; no findings.");
       return;
@@ -132,7 +132,7 @@ async function runReviewLoop(createOpencode, client, sessionID, root) {
   );
 }
 
-async function runReviewCommand(createOpencode, root) {
+async function runReviewCommand(client, root) {
   const commandName =
     process.env.ORCHESTRATOR_REVIEW_COMMAND || DEFAULT_REVIEW_COMMAND_NAME;
   const commandArguments =
@@ -142,65 +142,56 @@ async function runReviewCommand(createOpencode, root) {
     process.env.ORCHESTRATOR_REVIEW_TIMEOUT_MS,
     DEFAULT_REVIEW_TIMEOUT_MS
   );
+  const session = await unwrap(
+    client.session.create({
+      query: { directory: root },
+      body: { title: "Review" },
+    }),
+    "session.create"
+  );
 
-  const { client, server } = await createOpencode({
-    config: buildConfig(DEFAULT_MODEL),
-  });
+  const sessionID = extractSessionID(session, "session.create (review instance)");
+  const commandResult = await unwrap(
+    client.session.command({
+      path: { id: sessionID },
+      query: { directory: root },
+      body: {
+        command: commandName,
+        arguments: commandArguments,
+        agent: DEFAULT_AGENT,
+        model: DEFAULT_MODEL,
+      },
+    }),
+    "session.command"
+  );
 
-  try {
-    const session = await unwrap(
-      client.session.create({
+  const commandMessageID = extractMessageID(commandResult);
+  await waitForMessageComplete(
+    client,
+    sessionID,
+    commandMessageID,
+    root,
+    timeoutMs
+  );
+
+  let parts = commandResult?.parts ?? [];
+  const messageID = extractMessageID(commandResult);
+  if (messageID) {
+    const message = await unwrap(
+      client.session.message({
+        path: { id: sessionID, messageID },
         query: { directory: root },
-        body: { title: "Review" },
       }),
-      "session.create"
+      "session.message"
     );
-
-    const sessionID = extractSessionID(session, "session.create (review instance)");
-    const commandResult = await unwrap(
-      client.session.command({
-        path: { id: sessionID },
-        query: { directory: root },
-        body: {
-          command: commandName,
-          arguments: commandArguments,
-          agent: DEFAULT_AGENT,
-          model: DEFAULT_MODEL,
-        },
-      }),
-      "session.command"
-    );
-
-    const commandMessageID = extractMessageID(commandResult);
-    await waitForMessageComplete(
-      client,
-      sessionID,
-      commandMessageID,
-      root,
-      timeoutMs
-    );
-
-    let parts = commandResult?.parts ?? [];
-    const messageID = extractMessageID(commandResult);
-    if (messageID) {
-      const message = await unwrap(
-        client.session.message({
-          path: { id: sessionID, messageID },
-          query: { directory: root },
-        }),
-        "session.message"
-      );
-      parts = message?.parts ?? parts;
-    }
-
-    const output = collectCommandOutput(parts);
-    if (!output.trim()) {
-      throw new Error("Review command produced no output.");
-    }
-    return extractReviewJson(output);
-  } finally {
-    await disposeInstance(client, server, root);
+    parts = message?.parts ?? parts;
   }
+
+  const output = collectCommandOutput(parts);
+  if (!output.trim()) {
+    throw new Error("Review command produced no output.");
+  }
+  return extractReviewJson(output);
 }
 
 async function sendPrompt(
