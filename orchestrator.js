@@ -447,12 +447,26 @@ async function fileExists(filePath) {
 }
 
 function unwrap(result, label) {
-  if (result && typeof result === "object" && "data" in result) {
-    if (result.error) {
-      throw new Error(`${label} failed: ${formatError(result.error)}`);
-    }
-    return result.data;
+  if (!result || typeof result !== "object") {
+    return result;
   }
+
+  const hasWrapperFields =
+    "request" in result ||
+    "response" in result ||
+    "error" in result ||
+    Object.prototype.hasOwnProperty.call(result, "data");
+
+  if (result.error) {
+    throw new Error(`${label} failed: ${formatError(result.error)}`);
+  }
+
+  if (hasWrapperFields) {
+    if ("data" in result || result.data !== undefined) {
+      return result.data;
+    }
+  }
+
   return result;
 }
 
@@ -464,8 +478,12 @@ function extractSessionID(session, context) {
   const candidates = [
     session.id,
     session.sessionID,
+    session.data?.id,
+    session.data?.sessionID,
     session.info?.id,
     session.info?.sessionID,
+    session.data?.info?.id,
+    session.data?.info?.sessionID,
     session.properties?.id,
     session.properties?.sessionID,
     session.properties?.info?.id,
