@@ -2,6 +2,7 @@
 
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const DEFAULT_MODEL = "github-copilot/gpt-5.2-codex";
 const COMMIT_MODEL = "github-copilot/gpt-5-mini";
 const DEFAULT_AGENT = "build-gpt-5.2-codex";
@@ -229,12 +230,14 @@ async function sendPrompt(
   logDebug(
     `Sending prompt to session ${sessionID}: ${summarizeText(text, 160)}`
   );
-  const response = await callClient(
-    "session.prompt",
-    client.session.prompt({
+  const messageID = generateMessageID();
+  await callClient(
+    "session.promptAsync",
+    client.session.promptAsync({
       path: { id: sessionID },
       query: { directory: root },
       body: {
+        messageID,
         agent: agentSpec,
         model,
         parts: [{ type: "text", text }],
@@ -242,7 +245,7 @@ async function sendPrompt(
     })
   );
 
-  return extractMessageID(response);
+  return messageID;
 }
 
 async function waitForSessionIdle(client, sessionID, root, timeoutOverrideMs) {
@@ -326,13 +329,26 @@ async function waitForMessageComplete(
   let attempt = 0;
   while (Date.now() - start < timeoutMs) {
     attempt += 1;
-    const message = await callClient(
-      "session.message",
-      client.session.message({
-        path: { id: sessionID, messageID },
-        query: { directory: root },
-      })
-    );
+    let message;
+    try {
+      message = await callClient(
+        "session.message",
+        client.session.message({
+          path: { id: sessionID, messageID },
+          query: { directory: root },
+        })
+      );
+    } catch (error) {
+      const formatted = formatError(error).toLowerCase();
+      if (formatted.includes("not found") || formatted.includes("404")) {
+        logDebug(
+          `Message poll ${attempt}: message=${messageID}, not found yet`
+        );
+        await delay(pollIntervalMs);
+        continue;
+      }
+      throw error;
+    }
     const info = message?.info ?? message;
     logDebug(
       `Message poll ${attempt}: message=${messageID}, completed=${
@@ -709,6 +725,10 @@ function summarizeText(text, maxLength) {
     return trimmed;
   }
   return `${trimmed.slice(0, maxLength)}...`;
+}
+
+function generateMessageID() {
+  return `msg_${crypto.randomBytes(12).toString("hex")}`;
 }
 
 main().catch((error) => {
